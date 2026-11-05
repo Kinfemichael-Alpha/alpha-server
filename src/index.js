@@ -137,7 +137,8 @@ async function handleRegister(request, env) {
       ).bind(phone, b.device_id, t),
       env.DB.prepare(
         "INSERT INTO payments (phone, device_id, tier, txn_id, method, created_at) VALUES (?, ?, ?, ?, ?, ?)"
-      ).bind(phone, b.device_id, tier, txn, method, t)
+      ).bind(phone, b.device_id, tier, txn, method, t),
+      env.DB.prepare("DELETE FROM wipes WHERE device_id = ?").bind(b.device_id)
     ]);
   } catch (e) {
     if (String(e).includes("UNIQUE")) return fail("txn_used", 409);
@@ -238,9 +239,10 @@ async function handleTrial(request, env) {
     if (Number(tiers.trial_seconds) > 0) seconds = Number(tiers.trial_seconds);
   } catch {}
 
-  await env.DB.prepare("INSERT INTO trials (phone, device_id, created_at) VALUES (?, ?, ?)")
-    .bind(phone, b.device_id, now())
-    .run();
+  await env.DB.batch([
+    env.DB.prepare("INSERT INTO trials (phone, device_id, created_at) VALUES (?, ?, ?)").bind(phone, b.device_id, now()),
+    env.DB.prepare("DELETE FROM wipes WHERE device_id = ?").bind(b.device_id)
+  ]);
   const tk = await makeToken(env, phone, b.device_id, 1, seconds + 60);
   return json({ state: "trial", tier: 1, seconds, token: tk.token, exp: tk.exp });
 }
