@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "currency": "ETB",
+  "trial_seconds": 300,
+  "offline_days": 7,
+  "pay_to": {
+    "cbe": "0000000000000",
+    "telebirr": "0900000000"
+  },
+  "tiers": {
+    "0": { "name": "Free", "price": 0, "ads": true, "books": true, "past_papers": "view", "ai_offline": false, "ai_online": false, "generated": false, "daily_questions": 0, "custom": false, "key_mode": "none" },
+    "1": { "name": "Trial", "price": 0, "ads": true, "books": true, "past_papers": "view", "ai_offline": false, "ai_online": false, "generated": false, "daily_questions": 0, "custom": false, "key_mode": "none" },
+    "2": { "name": "First", "price": 0, "ads": true, "books": true, "past_papers": "exam", "ai_offline": true, "ai_online": true, "generated": false, "daily_questions": 0, "custom": false, "key_mode": "own" },
+    "3": { "name": "Basic", "price": 0, "ads": true, "books": true, "past_papers": "exam", "ai_offline": true, "ai_online": true, "generated": true, "daily_questions": 100, "custom": false, "key_mode": "own" },
+    "4": { "name": "Full", "price": 0, "ads": true, "books": true, "past_papers": "exam", "ai_offline": true, "ai_online": true, "generated": true, "daily_questions": 100, "custom": false, "key_mode": "own" },
+    "5": { "name": "Ultimate", "price": 0, "ads": false, "books": true, "past_papers": "exam", "ai_offline": true, "ai_online": true, "generated": true, "daily_questions": 100, "custom": true, "key_mode": "ours" }
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "name": "alpha-server",
+  "main": "src/index.js",
+  "compatibility_date": "2025-11-01",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "alpha-db",
+      "database_id": "29fdf2df-46ef-4c73-977e-fb810fd54fce"
+    }
+  ],
+  "vars": {
+    "TIERS_URL": "https://huggingface.co/datasets/Kinfemichael/Alpha-links/resolve/main/tiers.json",
+    "TOKEN_DAYS": "7"
+  }
+}
