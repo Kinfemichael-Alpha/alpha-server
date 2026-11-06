@@ -157,7 +157,15 @@ async function handleRegister(request, env, ctx) {
   }
   const origin = new URL(request.url).origin;
   ctx.waitUntil(
-    notify(env, "New payment\n+" + phone + "\nLevel " + tier + " via " + method + "\nTxn: " + txn + "\n" + origin + "/admin")
+    (async () => {
+      let label = "Level " + tier;
+      try {
+        const tt = await getTiers(env);
+        const f = tt.tiers[String(tier)];
+        label += " " + f.name + " - expected " + f.price + " " + (tt.currency || "ETB");
+      } catch {}
+      await notify(env, "New payment\n+" + phone + "\n" + label + "\nVia " + method + "\nTxn: " + txn + "\n" + origin + "/admin");
+    })()
   );
   return json({ state: "pending" });
 }
@@ -272,7 +280,20 @@ async function handleAdmin(request, env, path) {
     const rows = await env.DB.prepare(
       "SELECT id, phone, tier, txn_id, method, created_at FROM payments WHERE status = 'pending' ORDER BY id"
     ).all();
-    return json({ items: rows.results });
+    let tiers = {};
+    let currency = "ETB";
+    try {
+      const tt = await getTiers(env);
+      tiers = tt.tiers || {};
+      currency = tt.currency || currency;
+    } catch {}
+    const items = rows.results.map((r) => ({
+      ...r,
+      name: tiers[String(r.tier)] ? tiers[String(r.tier)].name : "",
+      price: tiers[String(r.tier)] ? tiers[String(r.tier)].price : null,
+      currency
+    }));
+    return json({ items, tiers });
   }
 
   if (path === "/admin/approve") {
@@ -281,8 +302,10 @@ async function handleAdmin(request, env, path) {
       .first();
     if (!p) return fail("not_found", 404);
     const user = await env.DB.prepare("SELECT * FROM users WHERE phone = ?").bind(p.phone).first();
+    const tier = [2, 3, 4, 5].includes(Number(b.tier)) ? Number(b.tier) : p.tier;
+    p.tier = tier;
     const stmts = [
-      env.DB.prepare("UPDATE payments SET status = 'approved', decided_at = ? WHERE id = ?").bind(now(), p.id)
+      env.DB.prepare("UPDATE payments SET status = 'approved', tier = ?, decided_at = ? WHERE id = ?").bind(tier, now(), p.id)
     ];
     if (user && user.recovery_hash) {
       stmts.push(
@@ -368,10 +391,18 @@ async function load(){
   el.innerHTML='';
   d.items.forEach(p=>{
     const c=document.createElement('div');c.className='card';
-    c.innerHTML='<b>+'+p.phone+'</b><br>Tier '+p.tier+' | '+p.method+'<br>Txn: '+p.txn_id+'<div class="row"><button>Approve</button><button class="no">Reject</button></div>';
-    const bs=c.querySelectorAll('button');
-    bs[0].onclick=async()=>{await call('/admin/approve',{id:p.id});load()};
-    bs[1].onclick=async()=>{await call('/admin/reject',{id:p.id});load()};
+    const t1=document.createElement('b');t1.textContent='+'+p.phone;
+    const t2=document.createElement('div');t2.textContent='Level '+p.tier+' '+(p.name||'')+' | expected '+(p.price===null?'?':p.price)+' '+p.currency;
+    const t3=document.createElement('div');t3.textContent=p.method+' | Txn: '+p.txn_id;
+    const sel=document.createElement('select');sel.style.cssText='font-size:16px;padding:10px;width:100%';
+    [2,3,4,5].forEach(n=>{const o=document.createElement('option');o.value=n;const f=d.tiers&&d.tiers[n];o.textContent='Approve as Level '+n+(f?' '+f.name+' ('+f.price+')':'');if(n===p.tier)o.selected=true;sel.appendChild(o)});
+    const row=document.createElement('div');row.className='row';
+    const ok=document.createElement('button');ok.textContent='Approve';
+    const no=document.createElement('button');no.textContent='Reject';no.className='no';
+    ok.onclick=async()=>{if(!confirm('Approve +'+p.phone+' as Level '+sel.value+'?'))return;await call('/admin/approve',{id:p.id,tier:Number(sel.value)});load()};
+    no.onclick=async()=>{if(!confirm('Reject this payment?'))return;await call('/admin/reject',{id:p.id});load()};
+    row.append(ok,no);
+    c.append(t1,t2,t3,sel,row);
     el.appendChild(c);
   });
   if(!d.items.length)el.textContent='No pending payments';
