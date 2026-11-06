@@ -104,7 +104,18 @@ async function getTiers(env) {
   return res.json();
 }
 
-async function handleRegister(request, env) {
+async function notify(env, text) {
+  if (!env.TG_BOT_TOKEN || !env.TG_CHAT_ID) return;
+  try {
+    await fetch("https://api.telegram.org/bot" + env.TG_BOT_TOKEN + "/sendMessage", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ chat_id: env.TG_CHAT_ID, text })
+    });
+  } catch {}
+}
+
+async function handleRegister(request, env, ctx) {
   const b = await readBody(request);
   const phone = normPhone(b.phone);
   const tier = Number(b.tier);
@@ -144,6 +155,10 @@ async function handleRegister(request, env) {
     if (String(e).includes("UNIQUE")) return fail("txn_used", 409);
     throw e;
   }
+  const origin = new URL(request.url).origin;
+  ctx.waitUntil(
+    notify(env, "New payment\n+" + phone + "\nLevel " + tier + " via " + method + "\nTxn: " + txn + "\n" + origin + "/admin")
+  );
   return json({ state: "pending" });
 }
 
@@ -368,7 +383,7 @@ async function reset(){
 </script></body></html>`;
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
     const path = new URL(request.url).pathname;
     try {
@@ -385,7 +400,7 @@ export default {
         return new Response(ADMIN_HTML, { headers: { "content-type": "text/html; charset=utf-8" } });
       }
       if (request.method === "POST") {
-        if (path === "/register") return await handleRegister(request, env);
+        if (path === "/register") return await handleRegister(request, env, ctx);
         if (path === "/status") return await handleStatus(request, env);
         if (path === "/move") return await handleMove(request, env);
         if (path === "/ack-wipe") return await handleAckWipe(request, env);
