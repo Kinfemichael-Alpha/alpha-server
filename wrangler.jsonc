@@ -11,6 +11,7 @@
   ],
   "vars": {
     "TIERS_URL": "https://huggingface.co/datasets/Kinfemichael/Alpha-links/resolve/main/tiers.json",
+    "PROVIDERS_URL": "https://huggingface.co/datasets/Kinfemichael/Alpha-links/resolve/main/providers.json",
     "TOKEN_DAYS": "7"
   }
 }

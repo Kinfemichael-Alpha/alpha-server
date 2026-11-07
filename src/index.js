@@ -186,6 +186,182 @@ async function relayAllowed(env, phone, userTier) {
   return !!row;
 }
 
+let relayKeysCache = null;
+
+function relayPools(env) {
+  if (!relayKeysCache) {
+    try { relayKeysCache = JSON.parse(env.RELAY_KEYS || "{}"); } catch { relayKeysCache = {}; }
+  }
+  return relayKeysCache;
+}
+
+function poolOf(env, id) {
+  let v = relayPools(env)[id];
+  if (!v && id === "gemini") v = env.GEMINI_KEYS;
+  const list = Array.isArray(v) ? v : String(v || "").split(",");
+  return list.map((k) => String(k).trim()).filter(Boolean);
+}
+
+function poolIds(env) {
+  const ids = new Set(Object.keys(relayPools(env)));
+  if (env.GEMINI_KEYS) ids.add("gemini");
+  return [...ids].filter((id) => poolOf(env, id).length > 0);
+}
+
+async function getProviders(env) {
+  const res = await fetch(env.PROVIDERS_URL, { cf: { cacheTtl: 600, cacheEverything: true } });
+  if (!res.ok) throw new Error("providers_unavailable");
+  const j = await res.json();
+  return Array.isArray(j) ? j : [];
+}
+
+async function handleRelay(request, env, path) {
+  const p = await relayUser(request, env);
+  if (!p) return relayFail("relay_denied", 401);
+  const m = path.match(/^\/relay\/([A-Za-z0-9_-]+)(\/.*)?$/);
+  if (!m) return relayFail("not_found", 404);
+  const id = m[1];
+  const rest = m[2] || "";
+  if (id === "_providers") return json({ ids: poolIds(env) });
+  const keys = poolOf(env, id);
+  if (!keys.length) return relayFail("relay_unavailable", 503);
+
+  let base;
+  let kind = "openai";
+  if (id === "gemini") {
+    base = "https://generativelanguage.googleapis.com/v1beta";
+    kind = "gemini";
+  } else {
+    let pr = null;
+    try { pr = (await getProviders(env)).find((x) => x && x.id === id); } catch {}
+    if (!pr || !/^https:\/\//.test(String(pr.base_url || ""))) return relayFail("relay_unavailable", 503);
+    base = String(pr.base_url).replace(/\/+$/, "");
+    if (pr.type === "anthropic") kind = "anthropic";
+  }
+
+  const okPath = kind === "gemini"
+    ? /^\/models(\/[A-Za-z0-9._-]+:(generateContent|streamGenerateContent))?$/.test(rest)
+    : /^\/(chat\/completions|models|v1\/messages|v1\/models)$/.test(rest);
+  if (!okPath) return relayFail("not_found", 404);
+
+  const src = new URL(request.url).searchParams;
+  const q = new URLSearchParams();
+  if (kind === "gemini" && src.get("alt") === "sse") q.set("alt", "sse");
+  if (/^\d{1,3}$/.test(src.get("pageSize") || "")) q.set("pageSize", src.get("pageSize"));
+  if (/^\d{1,3}$/.test(src.get("limit") || "")) q.set("limit", src.get("limit"));
+
+  let body;
+  if (request.method === "POST") {
+    body = await request.arrayBuffer();
+    if (body.byteLength > 4000000) return relayFail("too_large", 413);
+    if (!(await relayAllowed(env, p.p, p.t))) return relayFail("relay_limit", 429);
+  } else if (request.method !== "GET") {
+    return relayFail("not_found", 404);
+  }
+
+  const upstream = base + rest + (q.toString() ? "?" + q.toString() : "");
+  const start = Math.floor(Math.random() * keys.length);
+  const tries = Math.min(3, keys.length);
+  let last = null;
+  for (let i = 0; i < tries; i++) {
+    const key = keys[(start + i) % keys.length];
+    const headers = { "content-type": "application/json" };
+    if (kind === "gemini") headers["x-goog-api-key"] = key;
+    else if (kind === "anthropic") { headers["x-api-key"] = key; headers["anthropic-version"] = "2023-06-01"; }
+    else headers["authorization"] = "Bearer " + key;
+    const res = await fetch(upstream, { method: request.method, headers, body });
+    last = res;
+    if (res.status === 429 || res.status === 401 || res.status === 403) continue;
+    break;
+  }
+  return new Response(last.body, {
+    status: last.status,
+    headers: { "content-type": last.headers.get("content-type") || "application/json" }
+  });
+}
+
+async function notify(env, text) {
+  if (!env.TG_BOT_TOKEN || !env.TG_CHAT_ID) return;
+  try {
+    await fetch("https://api.telegram.org/bot" + env.TG_BOT_TOKEN + "/sendMessage", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ chat_id: env.TG_CHAT_ID, text })
+    });
+  } catch {}
+}
+
+const b64uBytes = (str) => {
+  const bin = atob(str.replace(/-/g, "+").replace(/_/g, "/"));
+  return Uint8Array.from(bin, (c) => c.charCodeAt(0));
+};
+
+let verifyKeyCache = null;
+
+async function verifyKey(env) {
+  if (!verifyKeyCache) {
+    const { kty, crv, x, y } = JSON.parse(env.SIGN_JWK);
+    verifyKeyCache = crypto.subtle.importKey("jwk", { kty, crv, x, y }, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
+  }
+  return verifyKeyCache;
+}
+
+async function relayUser(request, env) {
+  const tk = request.headers.get("x-alpha-token") || "";
+  const [body, sig] = tk.split(".");
+  if (!body || !sig) return null;
+  try {
+    const ok = await crypto.subtle.verify(
+      { name: "ECDSA", hash: "SHA-256" },
+      await verifyKey(env),
+      b64uBytes(sig),
+      enc.encode(body)
+    );
+    if (!ok) return null;
+    const p = JSON.parse(new TextDecoder().decode(b64uBytes(body)));
+    if (!p.exp || p.exp < now()) return null;
+    const u = await env.DB.prepare("SELECT tier, status, device_id FROM users WHERE phone = ?").bind(p.p).first();
+    if (!u || u.status !== "active" || u.device_id !== p.d) return null;
+    let ours = u.tier === 5;
+    try {
+      const tt = await getTiers(env);
+      const f = tt.tiers[String(u.tier)];
+      if (f) ours = f.key_mode === "ours";
+    } catch {}
+    return ours ? p : null;
+  } catch {
+    return null;
+  }
+}
+
+const relayFail = (message, status) =>
+  new Response(JSON.stringify({ error: { code: status, message, status: "RELAY" } }), {
+    status,
+    headers: { "content-type": "application/json" }
+  });
+
+let usageReady = false;
+
+async function relayAllowed(env, phone, userTier) {
+  if (!usageReady) {
+    await env.DB.prepare(
+      "CREATE TABLE IF NOT EXISTS relay_usage (phone TEXT NOT NULL, day INTEGER NOT NULL, n INTEGER NOT NULL, PRIMARY KEY (phone, day))"
+    ).run();
+    usageReady = true;
+  }
+  let limit = 300;
+  try {
+    const tt = await getTiers(env);
+    const f = tt.tiers[String(userTier)];
+    if (f && Number(f.relay_daily) > 0) limit = Number(f.relay_daily);
+  } catch {}
+  const day = Math.floor((Date.now() + 3 * 3600 * 1000) / 86400000);
+  const row = await env.DB.prepare(
+    "INSERT INTO relay_usage (phone, day, n) VALUES (?, ?, 1) ON CONFLICT(phone, day) DO UPDATE SET n = n + 1 WHERE n < ? RETURNING n"
+  ).bind(phone, day, limit).first();
+  return !!row;
+}
+
 async function handleGemini(request, env, path) {
   const p = await relayUser(request, env);
   if (!p) return relayFail("relay_denied", 401);
@@ -529,7 +705,8 @@ export default {
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
     const path = new URL(request.url).pathname;
     try {
-      if (path.startsWith("/gemini/")) return await handleGemini(request, env, path);
+      if (path.startsWith("/gemini/")) return await handleRelay(request, env, "/relay/gemini" + path.slice(7));
+      if (path.startsWith("/relay/")) return await handleRelay(request, env, path);
       if (request.method === "GET" && path === "/") return json({ ok: true });
       if (request.method === "GET" && path === "/pubkey") return json(publicJwk(env));
       if (request.method === "GET" && path === "/tiers") {
