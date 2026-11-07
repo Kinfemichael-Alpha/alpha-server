@@ -115,6 +115,88 @@ async function notify(env, text) {
   } catch {}
 }
 
+const b64uBytes = (str) => {
+  const bin = atob(str.replace(/-/g, "+").replace(/_/g, "/"));
+  return Uint8Array.from(bin, (c) => c.charCodeAt(0));
+};
+
+let verifyKeyCache = null;
+
+async function verifyKey(env) {
+  if (!verifyKeyCache) {
+    const { kty, crv, x, y } = JSON.parse(env.SIGN_JWK);
+    verifyKeyCache = crypto.subtle.importKey("jwk", { kty, crv, x, y }, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
+  }
+  return verifyKeyCache;
+}
+
+async function relayUser(request, env) {
+  const tk = request.headers.get("x-alpha-token") || "";
+  const [body, sig] = tk.split(".");
+  if (!body || !sig) return null;
+  try {
+    const ok = await crypto.subtle.verify(
+      { name: "ECDSA", hash: "SHA-256" },
+      await verifyKey(env),
+      b64uBytes(sig),
+      enc.encode(body)
+    );
+    if (!ok) return null;
+    const p = JSON.parse(new TextDecoder().decode(b64uBytes(body)));
+    if (!p.exp || p.exp < now()) return null;
+    const u = await env.DB.prepare("SELECT tier, status, device_id FROM users WHERE phone = ?").bind(p.p).first();
+    if (!u || u.status !== "active" || u.device_id !== p.d) return null;
+    let ours = u.tier === 5;
+    try {
+      const tt = await getTiers(env);
+      const f = tt.tiers[String(u.tier)];
+      if (f) ours = f.key_mode === "ours";
+    } catch {}
+    return ours ? p : null;
+  } catch {
+    return null;
+  }
+}
+
+async function handleGemini(request, env, path) {
+  const p = await relayUser(request, env);
+  if (!p) return fail("relay_denied", 401);
+  const keys = String(env.GEMINI_KEYS || "").split(",").map((k) => k.trim()).filter(Boolean);
+  if (!keys.length) return fail("relay_unavailable", 503);
+  const rest = path.slice("/gemini".length);
+  if (!/^\/models(\/[A-Za-z0-9._-]+:(generateContent|streamGenerateContent))?$/.test(rest)) return fail("not_found", 404);
+  const src = new URL(request.url).searchParams;
+  const q = new URLSearchParams();
+  if (src.get("alt") === "sse") q.set("alt", "sse");
+  if (/^\d{1,3}$/.test(src.get("pageSize") || "")) q.set("pageSize", src.get("pageSize"));
+  const upstream = "https://generativelanguage.googleapis.com/v1beta" + rest + (q.toString() ? "?" + q.toString() : "");
+  let body;
+  if (request.method === "POST") {
+    body = await request.arrayBuffer();
+    if (body.byteLength > 2000000) return fail("too_large", 413);
+  } else if (request.method !== "GET") {
+    return fail("not_found", 404);
+  }
+  const start = Math.floor(Math.random() * keys.length);
+  const tries = Math.min(3, keys.length);
+  let last = null;
+  for (let i = 0; i < tries; i++) {
+    const key = keys[(start + i) % keys.length];
+    const res = await fetch(upstream, {
+      method: request.method,
+      headers: { "content-type": "application/json", "x-goog-api-key": key },
+      body
+    });
+    last = res;
+    if (res.status === 429 || res.status === 401 || res.status === 403) continue;
+    break;
+  }
+  return new Response(last.body, {
+    status: last.status,
+    headers: { "content-type": last.headers.get("content-type") || "application/json" }
+  });
+}
+
 async function handleRegister(request, env, ctx) {
   const b = await readBody(request);
   const phone = normPhone(b.phone);
@@ -418,6 +500,7 @@ export default {
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
     const path = new URL(request.url).pathname;
     try {
+      if (path.startsWith("/gemini/")) return await handleGemini(request, env, path);
       if (request.method === "GET" && path === "/") return json({ ok: true });
       if (request.method === "GET" && path === "/pubkey") return json(publicJwk(env));
       if (request.method === "GET" && path === "/tiers") {
