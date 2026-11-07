@@ -41,3 +41,25 @@ CREATE TABLE IF NOT EXISTS relay_usage (
   n INTEGER NOT NULL,
   PRIMARY KEY (phone, day)
 );
+
+CREATE TABLE IF NOT EXISTS admin_fails (
+  ip TEXT PRIMARY KEY,
+  n INTEGER NOT NULL,
+  ts INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS codes (
+  code TEXT PRIMARY KEY,
+  tier INTEGER NOT NULL,
+  uses_left INTEGER NOT NULL,
+  expires_at INTEGER,
+  note TEXT,
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS code_uses (
+  code TEXT NOT NULL,
+  phone TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (code, phone)
+);

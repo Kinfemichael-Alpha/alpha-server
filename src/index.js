@@ -349,6 +349,7 @@ async function handleStatus(request, env) {
   const user = await env.DB.prepare("SELECT * FROM users WHERE phone = ?").bind(phone).first();
   if (!user) return json({ state: "none" });
   if (user.device_id !== b.device_id) return json({ state: "other_device" });
+  if (user.status === "revoked") return json({ state: "none" });
   if (user.status === "pending") return json({ state: "pending" });
 
   const out = { state: "active", tier: user.tier };
@@ -435,10 +436,76 @@ async function handleTrial(request, env) {
   return json({ state: "trial", tier: 1, seconds, token: tk.token, exp: tk.exp });
 }
 
-async function handleAdmin(request, env, path) {
+let extraReady = false;
+
+async function ensureExtra(env) {
+  if (extraReady) return;
+  await env.DB.batch([
+    env.DB.prepare("CREATE TABLE IF NOT EXISTS admin_fails (ip TEXT PRIMARY KEY, n INTEGER NOT NULL, ts INTEGER NOT NULL)"),
+    env.DB.prepare("CREATE TABLE IF NOT EXISTS codes (code TEXT PRIMARY KEY, tier INTEGER NOT NULL, uses_left INTEGER NOT NULL, expires_at INTEGER, note TEXT, created_at INTEGER NOT NULL)"),
+    env.DB.prepare("CREATE TABLE IF NOT EXISTS code_uses (code TEXT NOT NULL, phone TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (code, phone))")
+  ]);
+  extraReady = true;
+}
+
+async function handleRedeem(request, env, ctx) {
+  await ensureExtra(env);
+  const b = await readBody(request);
+  const phone = normPhone(b.phone);
+  const code = String(b.code || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  if (!phone) return fail("bad_phone");
+  if (!validDevice(b.device_id)) return fail("bad_device");
+  if (code.length < 6) return fail("bad_code", 404);
+
+  const dashed = code.length === 8 ? code.slice(0, 4) + "-" + code.slice(4) : code;
+  const row = await env.DB.prepare("SELECT * FROM codes WHERE code = ?").bind(dashed).first();
+  if (!row || row.uses_left <= 0 || (row.expires_at && row.expires_at < now())) return fail("bad_code", 404);
+
+  const user = await env.DB.prepare("SELECT * FROM users WHERE phone = ?").bind(phone).first();
+  if (user && user.status === "active" && user.device_id !== b.device_id) return fail("already_registered", 409);
+  if (user && user.status === "active" && user.tier >= row.tier) return fail("not_an_upgrade", 409);
+  const used = await env.DB.prepare("SELECT 1 AS x FROM code_uses WHERE code = ? AND phone = ?").bind(dashed, phone).first();
+  if (used) return fail("code_used", 409);
+
+  const dec = await env.DB.prepare("UPDATE codes SET uses_left = uses_left - 1 WHERE code = ? AND uses_left > 0").bind(dashed).run();
+  if (!dec.meta || dec.meta.changes !== 1) return fail("bad_code", 404);
+
+  const t = now();
+  const needsCode = !user || !user.recovery_hash;
+  const rec = needsCode ? newRecoveryCode() : null;
+  const hash = needsCode ? await hashRecovery(phone, rec) : null;
+  await env.DB.batch([
+    env.DB.prepare(
+      "INSERT INTO users (phone, tier, status, device_id, recovery_hash, recovery_plain, created_at) VALUES (?, ?, 'active', ?, ?, ?, ?) " +
+        "ON CONFLICT(phone) DO UPDATE SET tier = excluded.tier, status = 'active', device_id = excluded.device_id, " +
+        "recovery_hash = COALESCE(users.recovery_hash, excluded.recovery_hash), " +
+        "recovery_plain = CASE WHEN users.recovery_hash IS NULL THEN excluded.recovery_plain ELSE users.recovery_plain END, fails = 0"
+    ).bind(phone, row.tier, b.device_id, hash, rec, t),
+    env.DB.prepare("INSERT INTO code_uses (code, phone, created_at) VALUES (?, ?, ?)").bind(dashed, phone, t),
+    env.DB.prepare("DELETE FROM wipes WHERE device_id = ?").bind(b.device_id)
+  ]);
+  ctx.waitUntil(notify(env, "Invite code used\n+" + phone + "\nLevel " + row.tier + "\nCode: " + dashed + "\nUses left: " + (row.uses_left - 1)));
+  return json({ state: "active" });
+}
+
+async function adminGate(request, env) {
+  await ensureExtra(env);
+  const ip = request.headers.get("cf-connecting-ip") || "unknown";
+  const t = now();
+  const row = await env.DB.prepare("SELECT n, ts FROM admin_fails WHERE ip = ?").bind(ip).first();
+  if (row && row.n >= 5 && t - row.ts < 900) return fail("locked", 429);
   if (!sameSecret(request.headers.get("x-admin-key") || "", env.ADMIN_KEY || "")) {
+    const n = row && t - row.ts < 900 ? row.n + 1 : 1;
+    await env.DB.prepare("INSERT INTO admin_fails (ip, n, ts) VALUES (?, ?, ?) ON CONFLICT(ip) DO UPDATE SET n = excluded.n, ts = excluded.ts").bind(ip, n, t).run();
     return fail("unauthorized", 401);
   }
+  if (row) await env.DB.prepare("DELETE FROM admin_fails WHERE ip = ?").bind(ip).run();
+  return null;
+}
+
+async function handleAdmin(request, env, path) {
+  const denied = await adminGate(request, env);
+  if (denied) return denied;
   const b = request.method === "POST" ? await readBody(request) : {};
 
   if (path === "/admin/pending") {
@@ -501,6 +568,61 @@ async function handleAdmin(request, env, path) {
     return json({ sign_jwk: JSON.stringify(await crypto.subtle.exportKey("jwk", pair.privateKey)) });
   }
 
+  if (path === "/admin/user") {
+    const phone = normPhone(b.phone);
+    if (!phone) return fail("bad_phone");
+    const u = await env.DB.prepare("SELECT phone, tier, status, device_id, created_at FROM users WHERE phone = ?").bind(phone).first();
+    if (!u) return fail("not_found", 404);
+    const pays = await env.DB.prepare("SELECT tier, txn_id, method, status, created_at FROM payments WHERE phone = ? ORDER BY id DESC LIMIT 5").bind(phone).all();
+    return json({ user: { ...u, device_id: u.device_id ? "..." + u.device_id.slice(-6) : null }, payments: pays.results });
+  }
+
+  if (path === "/admin/set_tier") {
+    const phone = normPhone(b.phone);
+    const tier = Number(b.tier);
+    if (!phone || ![0, 2, 3, 4, 5].includes(tier)) return fail("bad_request");
+    const u = await env.DB.prepare("SELECT status FROM users WHERE phone = ?").bind(phone).first();
+    if (!u || u.status !== "active") return fail("not_found", 404);
+    await env.DB.prepare("UPDATE users SET tier = ? WHERE phone = ?").bind(tier, phone).run();
+    return json({ ok: true });
+  }
+
+  if (path === "/admin/revoke") {
+    const phone = normPhone(b.phone);
+    if (!phone) return fail("bad_phone");
+    const u = await env.DB.prepare("SELECT device_id FROM users WHERE phone = ?").bind(phone).first();
+    if (!u) return fail("not_found", 404);
+    const stmts = [env.DB.prepare("UPDATE users SET tier = 0, status = 'revoked', recovery_plain = NULL WHERE phone = ?").bind(phone)];
+    if (u.device_id) {
+      stmts.push(env.DB.prepare("INSERT OR REPLACE INTO wipes (device_id, phone, created_at) VALUES (?, ?, ?)").bind(u.device_id, phone, now()));
+    }
+    await env.DB.batch(stmts);
+    return json({ ok: true });
+  }
+
+  if (path === "/admin/code/create") {
+    const tier = Number(b.tier);
+    const uses = Math.min(Math.max(Math.floor(Number(b.uses) || 1), 1), 1000);
+    const days = Math.floor(Number(b.days) || 0);
+    if (![2, 3, 4, 5].includes(tier)) return fail("bad_tier");
+    const raw = newRecoveryCode().replace("-", "");
+    const code = raw.slice(0, 4) + "-" + raw.slice(4, 8);
+    await env.DB.prepare("INSERT INTO codes (code, tier, uses_left, expires_at, note, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+      .bind(code, tier, uses, days > 0 ? now() + days * 86400 : null, String(b.note || "").slice(0, 60), now())
+      .run();
+    return json({ code });
+  }
+
+  if (path === "/admin/code/list") {
+    const rows = await env.DB.prepare("SELECT code, tier, uses_left, expires_at, note FROM codes ORDER BY created_at DESC LIMIT 30").all();
+    return json({ items: rows.results });
+  }
+
+  if (path === "/admin/code/delete") {
+    await env.DB.prepare("DELETE FROM codes WHERE code = ?").bind(String(b.code || "")).run();
+    return json({ ok: true });
+  }
+
   if (path === "/admin/reset") {
     const phone = normPhone(b.phone);
     if (!phone) return fail("bad_phone");
@@ -532,6 +654,17 @@ button.no{background:#b71c1c}
 <input id="key" type="password" placeholder="Admin key">
 <button onclick="load()">Load pending payments</button>
 <div id="list"></div>
+<h4>Find user</h4>
+<input id="fu" placeholder="Phone number">
+<button onclick="findUser()">Find</button>
+<div id="uinfo"></div>
+<h4>Invite codes</h4>
+<select id="ct" style="font-size:16px;padding:10px;width:100%"><option value="2">Level 2</option><option value="3">Level 3</option><option value="4">Level 4</option><option value="5">Level 5</option></select>
+<input id="cu" placeholder="How many people can use it (default 1)">
+<input id="cd" placeholder="Days until it expires (empty = never)">
+<input id="cn" placeholder="Note (optional)">
+<button onclick="mkCode()">Create code</button>
+<div id="clist"></div>
 <h4>Reset recovery code</h4>
 <input id="ph" placeholder="Phone number">
 <button onclick="reset()">Reset</button>
@@ -572,6 +705,32 @@ async function load(){
   });
   if(!d.items.length)el.textContent='No pending payments';
 }
+async function findUser(){
+  const el=document.getElementById('uinfo');el.textContent='';
+  const d=await call('/admin/user',{phone:document.getElementById('fu').value});
+  if(d.error){el.textContent=d.error;return}
+  const u=d.user;
+  const c=document.createElement('div');c.className='card';
+  const a=document.createElement('div');a.textContent='+'+u.phone+' | Level '+u.tier+' | '+u.status+' | device '+(u.device_id||'-');
+  c.appendChild(a);
+  d.payments.forEach(p=>{const x=document.createElement('div');x.textContent='Pay: Level '+p.tier+' '+p.method+' '+p.txn_id+' '+p.status;c.appendChild(x)});
+  const sel=document.createElement('select');sel.style.cssText='font-size:16px;padding:10px;width:100%';
+  [0,2,3,4,5].forEach(n=>{const o=document.createElement('option');o.value=n;o.textContent='Set to Level '+n;if(n===u.tier)o.selected=true;sel.appendChild(o)});
+  const set=document.createElement('button');set.textContent='Apply level';
+  set.onclick=async()=>{if(!confirm('Set +'+u.phone+' to Level '+sel.value+'?'))return;const r=await call('/admin/set_tier',{phone:u.phone,tier:Number(sel.value)});el.textContent=r.error||'Done';};
+  const rv=document.createElement('button');rv.textContent='Revoke and wipe phone';rv.className='no';
+  rv.onclick=async()=>{if(!confirm('Revoke +'+u.phone+' and wipe their phone?'))return;const r=await call('/admin/revoke',{phone:u.phone});el.textContent=r.error||'Revoked';};
+  c.append(sel,set,rv);
+  el.appendChild(c);
+}
+async function mkCode(){
+  const d=await call('/admin/code/create',{tier:Number(document.getElementById('ct').value),uses:Number(document.getElementById('cu').value)||1,days:Number(document.getElementById('cd').value)||0,note:document.getElementById('cn').value});
+  const el=document.getElementById('clist');
+  if(d.error){el.textContent=d.error;return}
+  el.textContent='New code: '+d.code;
+  const l=await call('/admin/code/list');
+  (l.items||[]).forEach(i=>{const x=document.createElement('div');x.textContent=i.code+' | Level '+i.tier+' | left '+i.uses_left+(i.note?' | '+i.note:'');el.appendChild(x)});
+}
 async function reset(){
   const d=await call('/admin/reset',{phone:document.getElementById('ph').value});
   document.getElementById('out').textContent=d.recovery_code?('New code: '+d.recovery_code):d.error;
@@ -602,6 +761,7 @@ export default {
         if (path === "/status") return await handleStatus(request, env);
         if (path === "/move") return await handleMove(request, env);
         if (path === "/ack-wipe") return await handleAckWipe(request, env);
+        if (path === "/redeem") return await handleRedeem(request, env, ctx);
         if (path === "/trial") return await handleTrial(request, env);
         if (path.startsWith("/admin/")) return await handleAdmin(request, env, path);
       }
