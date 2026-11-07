@@ -34,3 +34,10 @@ CREATE TABLE IF NOT EXISTS trials (
   device_id TEXT NOT NULL UNIQUE,
   created_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS relay_usage (
+  phone TEXT NOT NULL,
+  day INTEGER NOT NULL,
+  n INTEGER NOT NULL,
+  PRIMARY KEY (phone, day)
+);

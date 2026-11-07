@@ -158,17 +158,46 @@ async function relayUser(request, env) {
   }
 }
 
+const relayFail = (message, status) =>
+  new Response(JSON.stringify({ error: { code: status, message, status: "RELAY" } }), {
+    status,
+    headers: { "content-type": "application/json" }
+  });
+
+let usageReady = false;
+
+async function relayAllowed(env, phone, userTier) {
+  if (!usageReady) {
+    await env.DB.prepare(
+      "CREATE TABLE IF NOT EXISTS relay_usage (phone TEXT NOT NULL, day INTEGER NOT NULL, n INTEGER NOT NULL, PRIMARY KEY (phone, day))"
+    ).run();
+    usageReady = true;
+  }
+  let limit = 300;
+  try {
+    const tt = await getTiers(env);
+    const f = tt.tiers[String(userTier)];
+    if (f && Number(f.relay_daily) > 0) limit = Number(f.relay_daily);
+  } catch {}
+  const day = Math.floor((Date.now() + 3 * 3600 * 1000) / 86400000);
+  const row = await env.DB.prepare(
+    "INSERT INTO relay_usage (phone, day, n) VALUES (?, ?, 1) ON CONFLICT(phone, day) DO UPDATE SET n = n + 1 WHERE n < ? RETURNING n"
+  ).bind(phone, day, limit).first();
+  return !!row;
+}
+
 async function handleGemini(request, env, path) {
   const p = await relayUser(request, env);
-  if (!p) return fail("relay_denied", 401);
+  if (!p) return relayFail("relay_denied", 401);
   const keys = String(env.GEMINI_KEYS || "").split(",").map((k) => k.trim()).filter(Boolean);
-  if (!keys.length) return fail("relay_unavailable", 503);
+  if (!keys.length) return relayFail("relay_unavailable", 503);
   const rest = path.slice("/gemini".length);
   if (!/^\/models(\/[A-Za-z0-9._-]+:(generateContent|streamGenerateContent))?$/.test(rest)) return fail("not_found", 404);
   const src = new URL(request.url).searchParams;
   const q = new URLSearchParams();
   if (src.get("alt") === "sse") q.set("alt", "sse");
   if (/^\d{1,3}$/.test(src.get("pageSize") || "")) q.set("pageSize", src.get("pageSize"));
+  if (request.method === "POST" && !(await relayAllowed(env, p.p, p.t))) return relayFail("relay_limit", 429);
   const upstream = "https://generativelanguage.googleapis.com/v1beta" + rest + (q.toString() ? "?" + q.toString() : "");
   let body;
   if (request.method === "POST") {
