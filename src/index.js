@@ -158,6 +158,44 @@ async function relayUser(request, env) {
   }
 }
 
+async function contentUser(request, env) {
+  const tk = request.headers.get("x-alpha-token") || "";
+  const [body, sig] = tk.split(".");
+  if (!body || !sig) return null;
+  try {
+    const ok = await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, await verifyKey(env), b64uBytes(sig), enc.encode(body));
+    if (!ok) return null;
+    const p = JSON.parse(new TextDecoder().decode(b64uBytes(body)));
+    if (!p.exp || p.exp < now()) return null;
+    const u = await env.DB.prepare("SELECT tier, status, device_id FROM users WHERE phone = ?").bind(p.p).first();
+    if (!u || u.status !== "active" || u.device_id !== p.d) return null;
+    let allowed = u.tier >= 3;
+    try {
+      const tt = await getTiers(env);
+      const f = tt.tiers[String(u.tier)];
+      if (f) allowed = f.generated === true;
+    } catch {}
+    return allowed ? p : null;
+  } catch {
+    return null;
+  }
+}
+
+async function handleContent(request, env, path) {
+  if (!env.HF_TOKEN) return fail("not_configured", 503);
+  const p = await contentUser(request, env);
+  if (!p) return fail("denied", 403);
+  let rel;
+  try { rel = decodeURIComponent(path.slice(9)); } catch { return fail("bad_path"); }
+  if (!rel || rel.includes("..") || rel.startsWith("/") || rel.length > 300) return fail("bad_path");
+  const repo = env.PAID_REPO || "Kinfemichael/Alpha-paid";
+  const url = "https://huggingface.co/datasets/" + repo + "/resolve/main/" + rel.split("/").map(encodeURIComponent).join("/");
+  const r = await fetch(url, { headers: { authorization: "Bearer " + env.HF_TOKEN, "user-agent": "alpha-server" } });
+  if (r.status === 404) return fail("not_found", 404);
+  if (!r.ok) return fail("upstream_error", 502);
+  return new Response(r.body, { status: 200, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "private, no-store", ...CORS } });
+}
+
 const relayFail = (message, status) =>
   new Response(JSON.stringify({ error: { code: status, message, status: "RELAY" } }), {
     status,
@@ -744,6 +782,7 @@ export default {
     try {
       if (path.startsWith("/gemini/")) return await handleRelay(request, env, "/relay/gemini" + path.slice(7));
       if (path.startsWith("/relay/")) return await handleRelay(request, env, path);
+      if (request.method === "GET" && path.startsWith("/content/")) return await handleContent(request, env, path);
       if (request.method === "GET" && path === "/") return json({ ok: true });
       if (request.method === "GET" && path === "/pubkey") return json(publicJwk(env));
       if (request.method === "GET" && path === "/tiers") {
