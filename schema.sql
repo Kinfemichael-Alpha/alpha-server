@@ -18,7 +18,10 @@ CREATE TABLE IF NOT EXISTS payments (
   method TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'pending',
   created_at INTEGER NOT NULL,
-  decided_at INTEGER
+  decided_at INTEGER,
+  payer_name TEXT,
+  payer_last4 TEXT,
+  amount REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status);

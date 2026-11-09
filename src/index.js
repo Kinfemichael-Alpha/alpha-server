@@ -318,17 +318,35 @@ async function handleRelay(request, env, path) {
   });
 }
 
+let payColsReady = false;
+async function ensurePayCols(env) {
+  if (payColsReady) return;
+  for (const col of ["payer_name TEXT", "payer_last4 TEXT", "amount REAL"]) {
+    try { await env.DB.prepare("ALTER TABLE payments ADD COLUMN " + col).run(); } catch {}
+  }
+  payColsReady = true;
+}
+
 async function handleRegister(request, env, ctx) {
+  await ensurePayCols(env);
   const b = await readBody(request);
   const phone = normPhone(b.phone);
   const tier = Number(b.tier);
-  const txn = String(b.txn_id || "").trim().toUpperCase();
+  let txn = String(b.txn_id || "").trim().toUpperCase();
   const method = b.method === "telebirr" ? "telebirr" : b.method === "cbe" ? "cbe" : null;
+  const payerName = String(b.payer_name || "").trim().replace(/\s+/g, " ").slice(0, 60);
+  const payerLast4 = String(b.payer_last4 || "").trim();
+  const amount = Number(b.amount);
   if (!phone) return fail("bad_phone");
   if (!validDevice(b.device_id)) return fail("bad_device");
   if (![2, 3, 4, 5].includes(tier)) return fail("bad_tier");
-  if (!/^[A-Z0-9]{6,32}$/.test(txn)) return fail("bad_txn");
   if (!method) return fail("bad_method");
+  if (method === "cbe") {
+    if (payerName.length < 3) return fail("bad_payer_name");
+    if (!/^\d{4}$/.test(payerLast4)) return fail("bad_last4");
+    if (!(amount > 0) || amount > 1000000) return fail("bad_amount");
+    txn = "CBE-" + now() + "-" + payerLast4;
+  } else if (!/^[A-Z0-9]{6,32}$/.test(txn)) return fail("bad_txn");
 
   const user = await env.DB.prepare("SELECT * FROM users WHERE phone = ?").bind(phone).first();
   if (user && user.status === "active" && user.device_id !== b.device_id) {
@@ -350,8 +368,8 @@ async function handleRegister(request, env, ctx) {
           "ON CONFLICT(phone) DO UPDATE SET device_id = CASE WHEN users.status = 'active' THEN users.device_id ELSE excluded.device_id END"
       ).bind(phone, b.device_id, t),
       env.DB.prepare(
-        "INSERT INTO payments (phone, device_id, tier, txn_id, method, created_at) VALUES (?, ?, ?, ?, ?, ?)"
-      ).bind(phone, b.device_id, tier, txn, method, t),
+        "INSERT INTO payments (phone, device_id, tier, txn_id, method, created_at, payer_name, payer_last4, amount) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      ).bind(phone, b.device_id, tier, txn, method, t, method === "cbe" ? payerName : null, method === "cbe" ? payerLast4 : null, method === "cbe" ? amount : null),
       env.DB.prepare("DELETE FROM wipes WHERE device_id = ?").bind(b.device_id)
     ]);
   } catch (e) {
@@ -367,7 +385,7 @@ async function handleRegister(request, env, ctx) {
         const f = tt.tiers[String(tier)];
         label += " " + f.name + " - expected " + f.price + " " + (tt.currency || "ETB");
       } catch {}
-      await notify(env, "New payment\n+" + phone + "\n" + label + "\nVia " + method + "\nTxn: " + txn + "\n" + origin + "/admin");
+      await notify(env, "New payment\n+" + phone + "\n" + label + "\nVia " + method + (method === "cbe" ? "\nSender: " + payerName + "\nAccount ends: " + payerLast4 + "\nAmount: " + amount : "\nTxn: " + txn) + "\n" + origin + "/admin");
     })()
   );
   return json({ state: "pending" });
@@ -546,9 +564,11 @@ async function handleAdmin(request, env, path) {
   if (denied) return denied;
   const b = request.method === "POST" ? await readBody(request) : {};
 
+  await ensurePayCols(env);
+
   if (path === "/admin/pending") {
     const rows = await env.DB.prepare(
-      "SELECT id, phone, tier, txn_id, method, created_at FROM payments WHERE status = 'pending' ORDER BY id"
+      "SELECT id, phone, tier, txn_id, method, created_at, payer_name, payer_last4, amount FROM payments WHERE status = 'pending' ORDER BY id"
     ).all();
     let tiers = {};
     let currency = "ETB";
@@ -611,7 +631,7 @@ async function handleAdmin(request, env, path) {
     if (!phone) return fail("bad_phone");
     const u = await env.DB.prepare("SELECT phone, tier, status, device_id, created_at FROM users WHERE phone = ?").bind(phone).first();
     if (!u) return fail("not_found", 404);
-    const pays = await env.DB.prepare("SELECT tier, txn_id, method, status, created_at FROM payments WHERE phone = ? ORDER BY id DESC LIMIT 5").bind(phone).all();
+    const pays = await env.DB.prepare("SELECT tier, txn_id, method, status, created_at, payer_name, payer_last4, amount FROM payments WHERE phone = ? ORDER BY id DESC LIMIT 5").bind(phone).all();
     return json({ user: { ...u, device_id: u.device_id ? "..." + u.device_id.slice(-6) : null }, payments: pays.results });
   }
 
@@ -729,7 +749,7 @@ async function load(){
     const c=document.createElement('div');c.className='card';
     const t1=document.createElement('b');t1.textContent='+'+p.phone;
     const t2=document.createElement('div');t2.textContent='Level '+p.tier+' '+(p.name||'')+' | expected '+(p.price===null?'?':p.price)+' '+p.currency;
-    const t3=document.createElement('div');t3.textContent=p.method+' | Txn: '+p.txn_id;
+    const t3=document.createElement('div');t3.textContent=p.method==='cbe'?('CBE | '+p.payer_name+' | acct ends '+p.payer_last4+' | sent '+p.amount+((p.price!==null&&p.amount<p.price)?'  (LESS than price!)':'')):(p.method+' | Txn: '+p.txn_id);
     const sel=document.createElement('select');sel.style.cssText='font-size:16px;padding:10px;width:100%';
     [2,3,4,5].forEach(n=>{const o=document.createElement('option');o.value=n;const f=d.tiers&&d.tiers[n];o.textContent='Approve as Level '+n+(f?' '+f.name+' ('+f.price+')':'');if(n===p.tier)o.selected=true;sel.appendChild(o)});
     const row=document.createElement('div');row.className='row';
@@ -751,7 +771,7 @@ async function findUser(){
   const c=document.createElement('div');c.className='card';
   const a=document.createElement('div');a.textContent='+'+u.phone+' | Level '+u.tier+' | '+u.status+' | device '+(u.device_id||'-');
   c.appendChild(a);
-  d.payments.forEach(p=>{const x=document.createElement('div');x.textContent='Pay: Level '+p.tier+' '+p.method+' '+p.txn_id+' '+p.status;c.appendChild(x)});
+  d.payments.forEach(p=>{const x=document.createElement('div');x.textContent='Pay: Level '+p.tier+' '+p.method+' '+(p.method==='cbe'?(p.payer_name+' '+p.payer_last4+' '+p.amount):p.txn_id)+' '+p.status;c.appendChild(x)});
   const sel=document.createElement('select');sel.style.cssText='font-size:16px;padding:10px;width:100%';
   [0,2,3,4,5].forEach(n=>{const o=document.createElement('option');o.value=n;o.textContent='Set to Level '+n;if(n===u.tier)o.selected=true;sel.appendChild(o)});
   const set=document.createElement('button');set.textContent='Apply level';
