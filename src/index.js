@@ -358,7 +358,10 @@ async function handleRegister(request, env, ctx) {
   const pending = await env.DB.prepare(
     "SELECT id FROM payments WHERE phone = ? AND status = 'pending'"
   ).bind(phone).first();
-  if (pending) return fail("payment_pending", 409);
+  if (pending) {
+    if (user && user.device_id === b.device_id) return json({ state: "pending" });
+    return fail("payment_pending", 409);
+  }
 
   const t = now();
   try {
@@ -406,7 +409,11 @@ async function handleStatus(request, env) {
   if (!user) return json({ state: "none" });
   if (user.device_id !== b.device_id) return json({ state: "other_device" });
   if (user.status === "revoked") return json({ state: "none" });
-  if (user.status === "pending") return json({ state: "pending" });
+  if (user.status === "pending") {
+    const last = await env.DB.prepare("SELECT status FROM payments WHERE phone = ? ORDER BY id DESC LIMIT 1").bind(phone).first();
+    if (last && last.status === "rejected") return json({ state: "rejected" });
+    return json({ state: "pending" });
+  }
 
   const out = { state: "active", tier: user.tier };
   if (user.recovery_plain) {
