@@ -347,6 +347,31 @@ async function ensurePayCols(env) {
   payColsReady = true;
 }
 
+let reportReady = false;
+async function handleReport(request, env, ctx) {
+  const b = await readBody(request);
+  if (!validDevice(b.device_id)) return fail("bad_device");
+  if (!reportReady) {
+    await env.DB.prepare("CREATE TABLE IF NOT EXISTS reports (k TEXT NOT NULL, day TEXT NOT NULL, n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (k, day))").run();
+    reportReady = true;
+  }
+  const day = new Date(Date.now() + 3 * 3600 * 1000).toISOString().slice(0, 10);
+  const ip = request.headers.get("cf-connecting-ip") || "-";
+  for (const [k, max] of [["d:" + b.device_id, 10], ["ip:" + ip, 40]]) {
+    const r = await env.DB.prepare(
+      "INSERT INTO reports (k, day, n) VALUES (?, ?, 1) ON CONFLICT(k, day) DO UPDATE SET n = n + 1 WHERE n < ? RETURNING n"
+    ).bind(k, day, max).first();
+    if (!r) return fail("too_many", 429);
+  }
+  const clean = (v, n) => String(v || "").replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, "").slice(0, n);
+  const kind = b.kind === "crash" ? "Crash" : "Problem";
+  const msg = kind + " report\nApp " + clean(b.app, 20) + " | " + clean(b.model, 60) + " | Android " + clean(b.android, 20) +
+    "\nState: " + clean(b.state, 20) + " level " + clean(b.tier, 4) + " | device ..." + b.device_id.slice(-6) +
+    (b.contact ? "\nContact: " + clean(b.contact, 80) : "") + "\n\n" + clean(b.text, 2500);
+  ctx.waitUntil(notify(env, msg.slice(0, 3800)));
+  return json({ ok: true });
+}
+
 async function handleRegister(request, env, ctx) {
   await ensurePayCols(env);
   await ensureUserCols(env);
@@ -884,6 +909,7 @@ export default {
         if (path === "/move") return await handleMove(request, env);
         if (path === "/ack-wipe") return await handleAckWipe(request, env);
         if (path === "/redeem") return await handleRedeem(request, env, ctx);
+        if (path === "/report") return await handleReport(request, env, ctx);
         if (path === "/trial") return await handleTrial(request, env);
         if (path.startsWith("/admin/")) return await handleAdmin(request, env, path);
       }
