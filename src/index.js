@@ -144,8 +144,8 @@ async function relayUser(request, env) {
     if (!ok) return null;
     const p = JSON.parse(new TextDecoder().decode(b64uBytes(body)));
     if (!p.exp || p.exp < now()) return null;
-    const u = await env.DB.prepare("SELECT tier, status, device_id FROM users WHERE phone = ?").bind(p.p).first();
-    if (!u || u.status !== "active" || u.device_id !== p.d) return null;
+    const u = await env.DB.prepare("SELECT tier, status, device_id, expires_at FROM users WHERE phone = ?").bind(p.p).first();
+    if (!u || u.status !== "active" || u.device_id !== p.d || (u.expires_at && u.expires_at <= now())) return null;
     let ours = u.tier === 5;
     try {
       const tt = await getTiers(env);
@@ -167,8 +167,8 @@ async function contentUser(request, env) {
     if (!ok) return null;
     const p = JSON.parse(new TextDecoder().decode(b64uBytes(body)));
     if (!p.exp || p.exp < now()) return null;
-    const u = await env.DB.prepare("SELECT tier, status, device_id FROM users WHERE phone = ?").bind(p.p).first();
-    if (!u || u.status !== "active" || u.device_id !== p.d) return null;
+    const u = await env.DB.prepare("SELECT tier, status, device_id, expires_at FROM users WHERE phone = ?").bind(p.p).first();
+    if (!u || u.status !== "active" || u.device_id !== p.d || (u.expires_at && u.expires_at <= now())) return null;
     let allowed = u.tier >= 3;
     try {
       const tt = await getTiers(env);
@@ -318,6 +318,26 @@ async function handleRelay(request, env, path) {
   });
 }
 
+let userColsReady = false;
+async function ensureUserCols(env) {
+  if (userColsReady) return;
+  try { await env.DB.prepare("ALTER TABLE users ADD COLUMN expires_at INTEGER").run(); } catch {}
+  userColsReady = true;
+}
+
+async function expiryFor(env, tier, base) {
+  try {
+    const cfg = ((await getTiers(env)).tiers || {})[String(tier)] || {};
+    const days = Number(cfg.duration_days);
+    if (days > 0) return Math.max(now(), base || 0) + Math.floor(days * 86400);
+    if (typeof cfg.valid_until === "string" && /^\d{4}-\d{2}-\d{2}$/.test(cfg.valid_until)) {
+      const ts = Date.parse(cfg.valid_until + "T23:59:59+03:00");
+      if (ts > 0) return Math.floor(ts / 1000);
+    }
+  } catch {}
+  return null;
+}
+
 let payColsReady = false;
 async function ensurePayCols(env) {
   if (payColsReady) return;
@@ -329,6 +349,7 @@ async function ensurePayCols(env) {
 
 async function handleRegister(request, env, ctx) {
   await ensurePayCols(env);
+  await ensureUserCols(env);
   const b = await readBody(request);
   const phone = normPhone(b.phone);
   const tier = Number(b.tier);
@@ -352,7 +373,7 @@ async function handleRegister(request, env, ctx) {
   if (user && user.status === "active" && user.device_id !== b.device_id) {
     return fail("already_registered", 409);
   }
-  if (user && user.status === "active" && tier <= user.tier) {
+  if (user && user.status === "active" && tier <= user.tier && !renewable(user, tier)) {
     return fail("not_an_upgrade", 409);
   }
   const pending = await env.DB.prepare(
@@ -394,7 +415,14 @@ async function handleRegister(request, env, ctx) {
   return json({ state: "pending" });
 }
 
+function renewable(user, tier) {
+  if (!user || !user.expires_at) return false;
+  const left = user.expires_at - now();
+  return left <= 0 || (left < 14 * 86400 && tier === user.tier);
+}
+
 async function handleStatus(request, env) {
+  await ensureUserCols(env);
   const b = await readBody(request);
   const phone = normPhone(b.phone);
   if (!phone) return fail("bad_phone");
@@ -415,20 +443,29 @@ async function handleStatus(request, env) {
     return json({ state: "pending" });
   }
 
-  const out = { state: "active", tier: user.tier };
+  const t1 = now();
+  if (user.expires_at && user.expires_at <= t1) {
+    const pp = await env.DB.prepare("SELECT 1 AS x FROM payments WHERE phone = ? AND status = 'pending'").bind(phone).first();
+    if (pp) return json({ state: "pending" });
+    return json({ state: "expired", tier: user.tier, expires: user.expires_at });
+  }
+
+  const out = { state: "active", tier: user.tier, expires: user.expires_at || 0 };
   if (user.recovery_plain) {
     out.recovery_code = user.recovery_plain;
     await env.DB.prepare("UPDATE users SET recovery_plain = NULL WHERE phone = ?")
       .bind(phone)
       .run();
   }
-  const tk = await makeToken(env, phone, b.device_id, user.tier);
+  const defTtl = Number(env.TOKEN_DAYS || 7) * 86400;
+  const tk = await makeToken(env, phone, b.device_id, user.tier, user.expires_at ? Math.min(defTtl, user.expires_at - t1) : defTtl);
   out.token = tk.token;
   out.exp = tk.exp;
   return json(out);
 }
 
 async function handleMove(request, env) {
+  await ensureUserCols(env);
   const b = await readBody(request);
   const phone = normPhone(b.phone);
   if (!phone) return fail("bad_phone");
@@ -461,8 +498,10 @@ async function handleMove(request, env) {
     );
   }
   await env.DB.batch(stmts);
-  const tk = await makeToken(env, phone, b.device_id, user.tier);
-  return json({ state: "active", tier: user.tier, token: tk.token, exp: tk.exp, recovery_code: code });
+  const defTtl = Number(env.TOKEN_DAYS || 7) * 86400;
+  if (user.expires_at && user.expires_at <= now()) return json({ state: "expired", tier: user.tier, expires: user.expires_at, recovery_code: code });
+  const tk = await makeToken(env, phone, b.device_id, user.tier, user.expires_at ? Math.min(defTtl, user.expires_at - now()) : defTtl);
+  return json({ state: "active", tier: user.tier, expires: user.expires_at || 0, token: tk.token, exp: tk.exp, recovery_code: code });
 }
 
 async function handleAckWipe(request, env) {
@@ -512,6 +551,7 @@ async function ensureExtra(env) {
 }
 
 async function handleRedeem(request, env, ctx) {
+  await ensureUserCols(env);
   await ensureExtra(env);
   const b = await readBody(request);
   const phone = normPhone(b.phone);
@@ -526,7 +566,7 @@ async function handleRedeem(request, env, ctx) {
 
   const user = await env.DB.prepare("SELECT * FROM users WHERE phone = ?").bind(phone).first();
   if (user && user.status === "active" && user.device_id !== b.device_id) return fail("already_registered", 409);
-  if (user && user.status === "active" && user.tier >= row.tier) return fail("not_an_upgrade", 409);
+  if (user && user.status === "active" && user.tier >= row.tier && !renewable(user, row.tier)) return fail("not_an_upgrade", 409);
   const used = await env.DB.prepare("SELECT 1 AS x FROM code_uses WHERE code = ? AND phone = ?").bind(dashed, phone).first();
   if (used) return fail("code_used", 409);
 
@@ -534,16 +574,17 @@ async function handleRedeem(request, env, ctx) {
   if (!dec.meta || dec.meta.changes !== 1) return fail("bad_code", 404);
 
   const t = now();
+  const expAt = await expiryFor(env, row.tier, user && user.tier === row.tier ? user.expires_at : null);
   const needsCode = !user || !user.recovery_hash;
   const rec = needsCode ? newRecoveryCode() : null;
   const hash = needsCode ? await hashRecovery(phone, rec) : null;
   await env.DB.batch([
     env.DB.prepare(
-      "INSERT INTO users (phone, tier, status, device_id, recovery_hash, recovery_plain, created_at) VALUES (?, ?, 'active', ?, ?, ?, ?) " +
-        "ON CONFLICT(phone) DO UPDATE SET tier = excluded.tier, status = 'active', device_id = excluded.device_id, " +
+      "INSERT INTO users (phone, tier, status, device_id, recovery_hash, recovery_plain, created_at, expires_at) VALUES (?, ?, 'active', ?, ?, ?, ?, ?) " +
+        "ON CONFLICT(phone) DO UPDATE SET tier = excluded.tier, status = 'active', device_id = excluded.device_id, expires_at = excluded.expires_at, " +
         "recovery_hash = COALESCE(users.recovery_hash, excluded.recovery_hash), " +
         "recovery_plain = CASE WHEN users.recovery_hash IS NULL THEN excluded.recovery_plain ELSE users.recovery_plain END, fails = 0"
-    ).bind(phone, row.tier, b.device_id, hash, rec, t),
+    ).bind(phone, row.tier, b.device_id, hash, rec, t, expAt),
     env.DB.prepare("INSERT INTO code_uses (code, phone, created_at) VALUES (?, ?, ?)").bind(dashed, phone, t),
     env.DB.prepare("DELETE FROM wipes WHERE device_id = ?").bind(b.device_id)
   ]);
@@ -572,6 +613,7 @@ async function handleAdmin(request, env, path) {
   const b = request.method === "POST" ? await readBody(request) : {};
 
   await ensurePayCols(env);
+  await ensureUserCols(env);
 
   if (path === "/admin/pending") {
     const rows = await env.DB.prepare(
@@ -601,20 +643,21 @@ async function handleAdmin(request, env, path) {
     const user = await env.DB.prepare("SELECT * FROM users WHERE phone = ?").bind(p.phone).first();
     const tier = [2, 3, 4, 5].includes(Number(b.tier)) ? Number(b.tier) : p.tier;
     p.tier = tier;
+    const expAt = await expiryFor(env, tier, user && user.tier === tier ? user.expires_at : null);
     const stmts = [
       env.DB.prepare("UPDATE payments SET status = 'approved', tier = ?, decided_at = ? WHERE id = ?").bind(tier, now(), p.id)
     ];
     if (user && user.recovery_hash) {
       stmts.push(
-        env.DB.prepare("UPDATE users SET tier = ?, status = 'active' WHERE phone = ?").bind(p.tier, p.phone)
+        env.DB.prepare("UPDATE users SET tier = ?, status = 'active', expires_at = ? WHERE phone = ?").bind(p.tier, expAt, p.phone)
       );
     } else {
       const code = newRecoveryCode();
       const h = await hashRecovery(p.phone, code);
       stmts.push(
         env.DB.prepare(
-          "UPDATE users SET tier = ?, status = 'active', recovery_hash = ?, recovery_plain = ?, fails = 0 WHERE phone = ?"
-        ).bind(p.tier, h, code, p.phone)
+          "UPDATE users SET tier = ?, status = 'active', expires_at = ?, recovery_hash = ?, recovery_plain = ?, fails = 0 WHERE phone = ?"
+        ).bind(p.tier, expAt, h, code, p.phone)
       );
     }
     await env.DB.batch(stmts);
@@ -636,7 +679,7 @@ async function handleAdmin(request, env, path) {
   if (path === "/admin/user") {
     const phone = normPhone(b.phone);
     if (!phone) return fail("bad_phone");
-    const u = await env.DB.prepare("SELECT phone, tier, status, device_id, created_at FROM users WHERE phone = ?").bind(phone).first();
+    const u = await env.DB.prepare("SELECT phone, tier, status, device_id, created_at, expires_at FROM users WHERE phone = ?").bind(phone).first();
     if (!u) return fail("not_found", 404);
     const pays = await env.DB.prepare("SELECT tier, txn_id, method, status, created_at, payer_name, payer_last4, amount FROM payments WHERE phone = ? ORDER BY id DESC LIMIT 5").bind(phone).all();
     return json({ user: { ...u, device_id: u.device_id ? "..." + u.device_id.slice(-6) : null }, payments: pays.results });
@@ -648,8 +691,19 @@ async function handleAdmin(request, env, path) {
     if (!phone || ![0, 2, 3, 4, 5].includes(tier)) return fail("bad_request");
     const u = await env.DB.prepare("SELECT status FROM users WHERE phone = ?").bind(phone).first();
     if (!u || u.status !== "active") return fail("not_found", 404);
-    await env.DB.prepare("UPDATE users SET tier = ? WHERE phone = ?").bind(tier, phone).run();
+    await env.DB.prepare("UPDATE users SET tier = ?, expires_at = ? WHERE phone = ?").bind(tier, tier >= 2 ? await expiryFor(env, tier, null) : null, phone).run();
     return json({ ok: true });
+  }
+
+  if (path === "/admin/extend") {
+    const phone = normPhone(b.phone);
+    const days = Math.floor(Number(b.days));
+    if (!phone || !(days > 0 && days <= 400)) return fail("bad_request");
+    const u = await env.DB.prepare("SELECT status, expires_at FROM users WHERE phone = ?").bind(phone).first();
+    if (!u || u.status !== "active") return fail("not_found", 404);
+    const to = Math.max(now(), u.expires_at || 0) + days * 86400;
+    await env.DB.prepare("UPDATE users SET expires_at = ? WHERE phone = ?").bind(to, phone).run();
+    return json({ ok: true, expires_at: to });
   }
 
   if (path === "/admin/revoke") {
@@ -776,7 +830,7 @@ async function findUser(){
   if(d.error){el.textContent=d.error;return}
   const u=d.user;
   const c=document.createElement('div');c.className='card';
-  const a=document.createElement('div');a.textContent='+'+u.phone+' | Level '+u.tier+' | '+u.status+' | device '+(u.device_id||'-');
+  const a=document.createElement('div');a.textContent='+'+u.phone+' | Level '+u.tier+' | '+u.status+' | device '+(u.device_id||'-')+' | expires '+(u.expires_at?new Date(u.expires_at*1000).toISOString().slice(0,10):'never');
   c.appendChild(a);
   d.payments.forEach(p=>{const x=document.createElement('div');x.textContent='Pay: Level '+p.tier+' '+p.method+' '+(p.method==='cbe'?(p.payer_name+' '+p.payer_last4+' '+p.amount):p.txn_id)+' '+p.status;c.appendChild(x)});
   const sel=document.createElement('select');sel.style.cssText='font-size:16px;padding:10px;width:100%';
@@ -785,7 +839,9 @@ async function findUser(){
   set.onclick=async()=>{if(!confirm('Set +'+u.phone+' to Level '+sel.value+'?'))return;const r=await call('/admin/set_tier',{phone:u.phone,tier:Number(sel.value)});el.textContent=r.error||'Done';};
   const rv=document.createElement('button');rv.textContent='Revoke and wipe phone';rv.className='no';
   rv.onclick=async()=>{if(!confirm('Revoke +'+u.phone+' and wipe their phone?'))return;const r=await call('/admin/revoke',{phone:u.phone});el.textContent=r.error||'Revoked';};
-  c.append(sel,set,rv);
+  const ex=document.createElement('button');ex.textContent='Extend 30 days';
+  ex.onclick=async()=>{const r=await call('/admin/extend',{phone:u.phone,days:30});el.textContent=r.error||'Extended';};
+  c.append(sel,set,ex,rv);
   el.appendChild(c);
 }
 async function mkCode(){

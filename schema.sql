@@ -6,7 +6,8 @@ CREATE TABLE IF NOT EXISTS users (
   recovery_hash TEXT,
   recovery_plain TEXT,
   fails INTEGER NOT NULL DEFAULT 0,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS payments (
