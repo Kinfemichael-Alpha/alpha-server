@@ -104,6 +104,22 @@ async function getTiers(env) {
   return res.json();
 }
 
+async function notifyTest(env) {
+  if (!env.TG_BOT_TOKEN) return { ok: false, problem: "TG_BOT_TOKEN secret is missing" };
+  if (!env.TG_CHAT_ID) return { ok: false, problem: "TG_CHAT_ID secret is missing" };
+  try {
+    const r = await fetch("https://api.telegram.org/bot" + env.TG_BOT_TOKEN + "/sendMessage", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ chat_id: env.TG_CHAT_ID, text: "ALPHA server test message. If you can read this, alerts work." })
+    });
+    const j = await r.json().catch(() => ({}));
+    return { ok: !!j.ok, telegram_status: r.status, telegram_says: j.description || null, chat_id_in_use: String(env.TG_CHAT_ID) };
+  } catch (e) {
+    return { ok: false, problem: "Could not reach Telegram" };
+  }
+}
+
 async function notify(env, text) {
   if (!env.TG_BOT_TOKEN || !env.TG_CHAT_ID) return;
   try {
@@ -720,6 +736,8 @@ async function handleAdmin(request, env, path) {
     return json({ ok: true });
   }
 
+  if (path === "/admin/testnotify") return json(await notifyTest(env));
+
   if (path === "/admin/extend") {
     const phone = normPhone(b.phone);
     const days = Math.floor(Number(b.days));
@@ -798,6 +816,9 @@ button.no{background:#b71c1c}
 <input id="key" type="password" placeholder="Admin key">
 <button onclick="load()">Load pending payments</button>
 <div id="list"></div>
+<h4>Telegram alerts</h4>
+<button onclick="testTg()">Send test message</button>
+<div id="tgres"></div>
 <h4>Find user</h4>
 <input id="fu" placeholder="Phone number">
 <button onclick="findUser()">Find</button>
@@ -849,6 +870,7 @@ async function load(){
   });
   if(!d.items.length)el.textContent='No pending payments';
 }
+async function testTg(){const r=await call('/admin/testnotify',{});document.getElementById('tgres').textContent=JSON.stringify(r)}
 async function findUser(){
   const el=document.getElementById('uinfo');el.textContent='';
   const d=await call('/admin/user',{phone:document.getElementById('fu').value});
