@@ -738,6 +738,34 @@ async function handleAdmin(request, env, path) {
 
   if (path === "/admin/testnotify") return json(await notifyTest(env));
 
+  if (path === "/admin/relaycheck") {
+    const out = { secret_present: !!env.RELAY_KEYS, legacy_gemini_keys: !!env.GEMINI_KEYS, parse_ok: true, pools: [], tiers: {}, providers_json: null };
+    try { JSON.parse(env.RELAY_KEYS || "{}"); } catch { out.parse_ok = false; }
+    try {
+      const tt = await getTiers(env);
+      for (const n of ["3", "4", "5"]) if (tt.tiers && tt.tiers[n]) out.tiers["level_" + n] = { key_mode: tt.tiers[n].key_mode || null, ai_online: tt.tiers[n].ai_online === true };
+    } catch { out.tiers = "could not read tiers.json"; }
+    let provs = [];
+    try { provs = await getProviders(env); out.providers_json = provs.map((x) => x && x.id); } catch { out.providers_json = "could not read providers.json"; }
+    for (const id of poolIds(env)) {
+      const keys = poolOf(env, id);
+      const row = { id, keys: keys.length, provider_found: id === "gemini" ? true : false, test: null };
+      try {
+        let url, headers = {};
+        if (id === "gemini") { url = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1"; headers["x-goog-api-key"] = keys[0]; }
+        else {
+          const pr = provs.find((x) => x && x.id === id);
+          row.provider_found = !!pr;
+          if (pr && /^https:\/\//.test(String(pr.base_url || ""))) { url = String(pr.base_url).replace(/\/+$/, "") + "/models"; headers["authorization"] = "Bearer " + keys[0]; }
+        }
+        if (url) { const r = await fetch(url, { headers }); row.test = "HTTP " + r.status + (r.ok ? " ok" : " failed"); }
+        else row.test = "no base_url in providers.json";
+      } catch { row.test = "request failed"; }
+      out.pools.push(row);
+    }
+    return json(out);
+  }
+
   if (path === "/admin/extend") {
     const phone = normPhone(b.phone);
     const days = Math.floor(Number(b.days));
@@ -819,6 +847,8 @@ button.no{background:#b71c1c}
 <h4>Telegram alerts</h4>
 <button onclick="testTg()">Send test message</button>
 <div id="tgres"></div>
+<button onclick="testAi()">Check AI keys</button>
+<div id="aires"></div>
 <h4>Find user</h4>
 <input id="fu" placeholder="Phone number">
 <button onclick="findUser()">Find</button>
@@ -871,6 +901,7 @@ async function load(){
   if(!d.items.length)el.textContent='No pending payments';
 }
 async function testTg(){const r=await call('/admin/testnotify',{});document.getElementById('tgres').textContent=JSON.stringify(r)}
+async function testAi(){const r=await call('/admin/relaycheck',{});document.getElementById('aires').textContent=JSON.stringify(r)}
 async function findUser(){
   const el=document.getElementById('uinfo');el.textContent='';
   const d=await call('/admin/user',{phone:document.getElementById('fu').value});
